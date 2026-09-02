@@ -1,0 +1,2 @@
+*.zst -delta -diff -merge -text
+*.bz2 -delta -diff -merge -text
