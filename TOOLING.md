@@ -96,8 +96,15 @@ wk2 브랜치로 들어갈 수 있다. `drivelog.conf` 의 `PROFILE_DONGLE` 을 
 # 지금 무엇이 올라가 있고 기기에 무엇이 남았는지
 ./drivelog.sh status --profile ccnc
 
+# 아직 안 올라간 것을 route 별로 묶어서 보여준다 (개수와 용량 포함)
+./drivelog.sh list --profile ccnc
+
 # 기기에서 받아 바로 업로드 (아직 안 올라간 것만)
 ./drivelog.sh upload --profile ccnc
+
+# route 를 골라서 업로드. 이름 일부만 줘도 되고 쉼표로 여러 개도 된다
+./drivelog.sh upload --profile ccnc --route 00000005
+./drivelog.sh upload --profile ccnc --route 00000005,00000006
 
 # 우선 몇 개만 시험
 ./drivelog.sh upload --profile ccnc --limit 3
@@ -116,6 +123,11 @@ wk2 브랜치로 들어갈 수 있다. `drivelog.conf` 의 `PROFILE_DONGLE` 을 
 ```
 
 집에서든 회사에서든 같은 명령을 그대로 쓴다. 프로필만 맞추면 된다.
+
+`list` 는 무엇을 올릴지 고르는 용도다. 기기의 세그먼트 중 아직 브랜치에 없는 것만
+route 단위로 묶어 개수와 총 용량을 보여준다. 거기서 route 이름을 골라 `--route` 로 넘긴다.
+크게 한 번에 올리기 부담스러우면 `--limit N` 으로 앞에서부터 N 개만 올릴 수도 있다.
+어느 쪽이든 중간에 끊겨도 이미 push 된 배치는 남고 다시 실행하면 이어서 간다.
 
 ## 두 PC 가 동시에 올릴 때
 
