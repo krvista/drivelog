@@ -63,6 +63,10 @@ human() {
 }
 
 # ---------- 인자 파싱 ----------
+show_usage() { sed -n '12,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+case "${1:-}" in
+  -h|--help|help) show_usage ;;
+esac
 CMD="${1:-status}"
 shift || true
 LIMIT=0
@@ -85,7 +89,7 @@ while [ $# -gt 0 ]; do
     --keep)     KEEP_ROUTES="$2"; shift 2 ;;
     --yes)      PRUNE_YES=1; shift ;;
     --dry-run)  DRY_RUN=1; shift ;;
-    -h|--help)  sed -n '2,16p' "$0"; exit 0 ;;
+    -h|--help)  show_usage ;;
     -*)         die "알 수 없는 옵션: $1" ;;
     *)          PUT_PATHS+=("$1"); shift ;;
   esac
