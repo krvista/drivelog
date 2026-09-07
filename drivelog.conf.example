@@ -1,0 +1,23 @@
+# drivelog.conf.example
+# 이 파일을 drivelog.conf 로 복사한 뒤 이 PC 에 맞게 고친다.
+# drivelog.conf 는 PC 마다 다르므로 리포지토리에 올리지 않는다.
+
+REMOTE_URL="https://github.com/krvista/drivelog.git"
+DEVICE_DATA_DIR="/data/media/0/realdata"
+REPO_SUBDIR="drivelog"
+
+# 한 커밋(=한 push)에 담을 파일 수. rlog.zst 는 개당 약 11 MB.
+BATCH_FILES=12
+
+# push 충돌 시 재시도 횟수 (두 PC 가 동시에 올릴 때 쓰인다).
+PUSH_RETRIES=10
+
+# ---- 프로필: 디바이스 <-> 브랜치 대응 ----
+# SSH 주소는 네트워크마다 다르다. 이 PC 에서 실제로 닿는 값으로 채울 것.
+# 집과 회사에서 주소가 다르면 프로필을 나눠도 된다.
+
+PROFILE_SSH[ccnc]="comma@192.168.1.135"
+PROFILE_BRANCH[ccnc]="ccnc-drivelog"
+
+PROFILE_SSH[wk2]="comma@192.168.1.136"
+PROFILE_BRANCH[wk2]="wk2-drivelog"
