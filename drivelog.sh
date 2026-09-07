@@ -411,8 +411,10 @@ cmd_status() {
   log "원격 파일 수  : $n_remote"
   [ "$n_pruned" -gt 0 ] && log "정리 완료     : $n_pruned (pruned.txt, 다시 올리지 않는다)"
   if [ "$n_remote" -gt 0 ]; then
-    log "가장 오래됨   : $(printf '%s\n' "$rf" | sort | head -1)"
-    log "가장 최근     : $(printf '%s\n' "$rf" | sort | tail -1)"
+    # 이름 순일 뿐 시간 순이 아니다. 기기를 다시 빌드하면 route 카운터가
+    # 0 부터 다시 시작하므로 "가장 오래됨/최근" 으로 읽으면 틀린다.
+    log "이름순 처음   : $(printf '%s\n' "$rf" | sort | head -1)"
+    log "이름순 끝     : $(printf '%s\n' "$rf" | sort | tail -1)"
   fi
   log "작업 클론 크기: $(du -sh "$WORK/repo" 2>/dev/null | cut -f1)  (데이터 blob 미포함)"
 
