@@ -16,6 +16,7 @@
 #   ./drivelog.sh upload --from-dir <디렉터리>    # 이미 받아둔 로컬 파일을 올린다
 #   ./drivelog.sh put <파일>...                   # 임의 파일을 브랜치 루트에 올린다
 #   ./drivelog.sh prune  [--keep N] [--yes]       # 오래된 route 를 브랜치에서 덜어낸다
+#   ./drivelog.sh init-order [--dry-run] [--yes]  # 업로드 순서 원장을 히스토리에서 복원(1회)
 
 set -euo pipefail
 
@@ -200,6 +201,44 @@ pruned_list() {
   "${G[@]}" cat-file -p "$BASE:$PRUNED_FILE" 2>/dev/null || true
 }
 
+# ---------- 업로드 순서 원장 ----------
+# prune 이 "무엇이 오래된 것인가" 를 판단하는 유일한 근거다.
+#
+# route 이름도 기기 시각도 믿을 수 없다:
+#   - 기기를 다시 빌드하면 route 카운터가 00000000 부터 다시 시작한다.
+#     (2026-09-06 실제 발생. 브랜치에 00000061 이 있는데 새 데이터가 00000005 다.)
+#   - GPS 를 못 잡으면 기기 시각이 엉뚱해진다 (지하주차장 주행).
+#   - 재빌드 직후 지하주차장 주행이면 둘 다 동시에 깨진다. 어떤 휴리스틱도 못 푼다.
+#
+# 반면 "우리가 언제 올렸는가" 는 우리가 안다. 출퇴근길에 모아서 올리므로
+# 업로드 순서가 곧 시간 순서다. 재빌드에도 시계 오차에도 영향받지 않는다.
+# 이 목록은 원격에만 있으므로 집/회사 PC 어디서 실행해도 같은 답이 나온다.
+ORDER_FILE="order.txt"
+order_list() {
+  "${G[@]}" cat-file -p "$BASE:$ORDER_FILE" 2>/dev/null || true
+}
+
+# route 이름들을 stdin 으로 받아 "정렬키<TAB>route" 를 출력한다.
+# 원장에 없는 route(구 도구로 올린 것)는 가장 오래된 것으로 취급한다.
+route_sort_keys() {
+  local rank_file="$1" r idx
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    idx="$(awk -v want="$r" '$2 == want { print $1; exit }' "$rank_file")"
+    if [ -n "$idx" ]; then
+      printf '1 %08d\t%s\n' "$idx" "$r"
+    else
+      printf '0 00000000\t%s\n' "$r"
+    fi
+  done
+}
+
+# 원장을 "순번 route" 형태로 펼친다 (route_sort_keys 조회용).
+order_rank_file() {
+  local out="$1"
+  order_list | { grep . || true; } | nl -ba -w1 -s' ' > "$out"
+}
+
 # 원격 기준 "이미 처리된" 파일 이름 전체 (현재 보관 중 + 정리 완료)
 # 주의: 빈 브랜치(아직 데이터가 없는 wk2 등)에서는 입력이 비어 grep 이 1 을 돌려준다.
 # set -e 아래에서 그대로 두면 함수가 조용히 중단되므로 반드시 삼켜야 한다.
@@ -347,20 +386,34 @@ merge_tree() {
 #   $1 = 스테이지 디렉터리 안의 파일명 목록 파일
 #   $2 = 커밋 메시지
 #   $3 = 저장 경로 접두사 ("" 이면 브랜치 루트)
+#   $4 = (선택) 이번 커밋에서 order.txt 에 덧붙일 route 이름 목록 파일
 build_and_push() {
-  local list_file="$1" msg="$2" prefix="$3"
-  local attempt subtree root commit
+  local list_file="$1" msg="$2" prefix="$3" order_add="${4:-}"
+  local attempt subtree root commit oblob
 
   stage_entries "$list_file" "$WORK/add.entries"
 
   # 두 PC 가 서로 다른 파일을 올리므로 충돌은 항상 병합 가능하다.
   # 진 쪽은 새 tip 위에 다시 쌓아 올리기만 하면 되므로 넉넉히 재시도한다.
   for ((attempt = 1; attempt <= PUSH_RETRIES; attempt++)); do
+    # order.txt 는 재시도할 때마다 새 tip 기준으로 다시 만든다.
+    # 그 사이 다른 PC 가 추가한 route 를 덮어쓰지 않기 위한 것이다.
+    # 먼저 올린 쪽이 앞에 남으므로 결과 순서가 곧 실제 업로드 순서가 된다.
+    if [ -n "$order_add" ]; then
+      { order_list; cat "$order_add"; } | { grep . || true; } \
+        | awk '!seen[$0]++' > "$WORK/order.new"
+      oblob="$("${G[@]}" hash-object -w --no-filters -- "$WORK/order.new")"
+      [ -n "$oblob" ] || die "order.txt 생성 실패"
+    fi
+
     if [ -n "$prefix" ]; then
       "${G[@]}" ls-tree "$BASE:$prefix" > "$WORK/old.sub" 2>/dev/null || : > "$WORK/old.sub"
       subtree="$(merge_tree "$WORK/old.sub" "$WORK/add.entries")"
       [ -n "$subtree" ] || die "서브트리 생성 실패"
       printf '040000 tree %s\t%s\n' "$subtree" "$prefix" > "$WORK/add.root"
+      if [ -n "$order_add" ]; then
+        printf '100644 blob %s\t%s\n' "$oblob" "$ORDER_FILE" >> "$WORK/add.root"
+      fi
       "${G[@]}" ls-tree "$BASE" > "$WORK/old.root"
       root="$(merge_tree "$WORK/old.root" "$WORK/add.root")"
     else
@@ -612,10 +665,15 @@ cmd_upload() {
       j=$((j + 1))
     done
 
+    # 이번 배치에 포함된 route 를 원장에 덧붙인다. 파일과 같은 커밋에 들어가므로
+    # 중간에 끊겨도 "올라갔는데 원장에 없는" 상태가 생기지 않는다.
+    sed 's/--[0-9]*--rlog\.zst$//' "$WORK/batch.list" \
+      | { grep . || true; } | awk '!seen[$0]++' > "$WORK/batch.routes"
+
     log "batch $bn/$batches  파일 ${j} 개  $(human "$bytes")  -> push"
     build_and_push "$WORK/batch.list" \
       "drivelog(ssh): add ${j} file(s) (batch ${bn}/${batches})" \
-      "$REPO_SUBDIR" || die "batch $bn push 실패"
+      "$REPO_SUBDIR" "$WORK/batch.routes" || die "batch $bn push 실패"
 
     rm -f "$WORK"/stage/* 2>/dev/null || true
   done
@@ -671,10 +729,32 @@ cmd_prune() {
     [ -n "$n" ] && route_of "$n" && printf '\n'
   done | sort -u)"
 
-  local n_routes keep_list
-  n_routes="$(printf '%s\n' "$routes" | count_lines)"
-  keep_list="$(printf '%s\n' "$routes" | tail -n "$KEEP_ROUTES")"
+  # 정렬 기준은 업로드 순서(order.txt)다. route 이름으로 정렬하면 안 된다.
+  # 기기 재빌드로 카운터가 되감기면 최신 주행이 가장 오래된 것으로 취급된다.
+  order_rank_file "$WORK/order.rank"
+  local n_ranked
+  n_ranked="$(count_lines < "$WORK/order.rank")"
+
+  local sorted_routes n_routes keep_list n_unranked
+  sorted_routes="$(printf '%s\n' "$routes" | route_sort_keys "$WORK/order.rank" \
+                   | sort | cut -f2-)"
+  n_routes="$(printf '%s\n' "$sorted_routes" | count_lines)"
+  n_unranked="$(printf '%s\n' "$routes" | route_sort_keys "$WORK/order.rank" \
+                | grep -c '^0 ' || true)"
+  keep_list="$(printf '%s\n' "$sorted_routes" | tail -n "$KEEP_ROUTES")"
+
   log "route 수: $n_routes,  유지: $(printf '%s\n' "$keep_list" | count_lines)"
+  log "정렬 기준: 업로드 순서 (order.txt, $n_ranked 개 기록됨)"
+  if [ "$n_unranked" -gt 0 ]; then
+    log "  · 원장에 없는 route $n_unranked 개는 가장 오래된 것으로 취급한다"
+    if [ "$n_ranked" -eq 0 ]; then
+      log ""
+      log "  주의: order.txt 가 비어 있어 전부 이름순으로 처리된다."
+      log "        기존 데이터의 순서를 git 히스토리에서 복원하려면 먼저 실행할 것:"
+      log "          ./drivelog.sh init-order --profile $PROFILE"
+      log ""
+    fi
+  fi
 
   local keep_files drop_files n_keep n_drop
   keep_files="$(printf '%s\n' "$rf" | while IFS= read -r n; do
@@ -692,8 +772,11 @@ cmd_prune() {
   if [ "$n_drop" -eq 0 ]; then log "지울 것이 없다."; return 0; fi
   if [ "$PRUNE_YES" -ne 1 ]; then
     log ""
-    log "삭제 대상 route:"
-    printf '%s\n' "$routes" | head -n "$((n_routes - KEEP_ROUTES))" | sed 's/^/  /' >&2
+    log "삭제 대상 route (업로드가 오래된 순):"
+    printf '%s\n' "$sorted_routes" | head -n "$((n_routes - KEEP_ROUTES))" | sed 's/^/  /' >&2
+    log ""
+    log "유지할 route (가장 최근 업로드 $KEEP_ROUTES 개):"
+    printf '%s\n' "$keep_list" | sed 's/^/  /' >&2
     log ""
     log "실제로 지우려면 --yes 를 붙일 것."
     return 0
@@ -736,11 +819,73 @@ cmd_prune() {
   step "완료. $n_drop 개 파일을 브랜치에서 덜어냈다 (히스토리에는 남아 있다)."
 }
 
+# ---------- 명령: init-order (원장 최초 생성, 1회) ----------
+# 구 도구로 올린 기존 파일들은 order.txt 에 없다. 그 순서를 git 히스토리에서
+# 복원한다. 각 파일이 "어느 커밋에서 처음 추가됐는가" 가 곧 업로드 시점이다.
+# 추정이 아니라 기록이므로 이름이나 기기 시각보다 정확하다.
+#
+# 이때만 히스토리 전체가 필요하다. --filter=blob:none 이므로 데이터 blob 은
+# 받지 않는다 (커밋과 트리만, 수 MB 수준).
+cmd_init_order() {
+  step "프로필 $PROFILE  ->  브랜치 $BRANCH  (업로드 순서 원장 생성)"
+  make_work_repo
+  refresh_tip
+
+  local existing
+  existing="$(order_list | { grep . || true; } | count_lines)"
+  if [ "$existing" -gt 0 ] && [ "$PRUNE_YES" -ne 1 ]; then
+    log "order.txt 에 이미 $existing 개가 있다."
+    log "다시 만들려면 --yes 를 붙일 것 (기존 순서는 덮어쓰인다)."
+    return 0
+  fi
+
+  log "히스토리를 받는다 (blob 제외, 커밋·트리만) …"
+  local hist="$WORK/hist"
+  git clone --quiet --filter=blob:none --no-checkout \
+    --single-branch --branch "$BRANCH" "$REMOTE_URL" "$hist" || auth_hint
+  local H=(git -C "$hist")
+
+  local n_commits
+  n_commits="$("${H[@]}" rev-list --count HEAD)"
+  log "커밋 $n_commits 개를 오래된 순으로 훑는다 …"
+
+  # 커밋을 오래된 순으로 보며, 각 커밋에서 처음 추가된 route 를 순서대로 기록한다.
+  "${H[@]}" log --reverse --format='%H' -- "$REPO_SUBDIR" \
+    | while IFS= read -r c; do
+        "${H[@]}" diff-tree --no-commit-id --name-only --diff-filter=A -r "$c" \
+          -- "$REPO_SUBDIR" 2>/dev/null || true
+      done \
+    | sed "s#^${REPO_SUBDIR}/##; s/--[0-9]*--rlog\.zst\$//" \
+    | { grep . || true; } | awk '!seen[$0]++' > "$WORK/stage/$ORDER_FILE"
+
+  local n_routes
+  n_routes="$(count_lines < "$WORK/stage/$ORDER_FILE")"
+  [ "$n_routes" -gt 0 ] || die "히스토리에서 route 를 찾지 못했다"
+
+  log "복원된 route: $n_routes 개"
+  log "  가장 먼저 올린 것: $(head -n1 "$WORK/stage/$ORDER_FILE")"
+  log "  가장 나중에 올린 것: $(tail -n1 "$WORK/stage/$ORDER_FILE")"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log ""
+    log "[dry-run] 아래 순서로 order.txt 를 올릴 예정이다:"
+    cat -n "$WORK/stage/$ORDER_FILE" | sed 's/^/  /' >&2
+    return 0
+  fi
+
+  printf '%s\n' "$ORDER_FILE" > "$WORK/order.list"
+  build_and_push "$WORK/order.list" \
+    "drivelog: init upload-order ledger ($n_routes routes from history)" "" \
+    || die "order.txt push 실패"
+  step "완료. 이제 prune 이 업로드 순서로 판단한다."
+}
+
 case "$CMD" in
-  status) cmd_status ;;
-  list)   cmd_list ;;
-  upload) cmd_upload ;;
-  put)    cmd_put ;;
-  prune)  cmd_prune ;;
-  *)      die "알 수 없는 명령: $CMD (status|list|upload|put|prune)" ;;
+  status)     cmd_status ;;
+  list)       cmd_list ;;
+  upload)     cmd_upload ;;
+  put)        cmd_put ;;
+  prune)      cmd_prune ;;
+  init-order) cmd_init_order ;;
+  *)          die "알 수 없는 명령: $CMD (status|list|upload|put|prune|init-order)" ;;
 esac
