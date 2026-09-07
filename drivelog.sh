@@ -12,6 +12,7 @@
 # 사용법:
 #   ./drivelog.sh status [--profile ccnc|wk2]
 #   ./drivelog.sh list   [--profile ccnc|wk2]     # 미업로드분을 route 별로 보여준다
+#   ./drivelog.sh pick   [--profile ccnc|wk2]     # 목록에서 번호로 골라 올린다 (대화형)
 #   ./drivelog.sh upload [--profile ccnc|wk2] [--route R[,R2]] [--limit N] [--dry-run]
 #   ./drivelog.sh upload --from-dir <디렉터리>    # 이미 받아둔 로컬 파일을 올린다
 #   ./drivelog.sh put <파일>...                   # 임의 파일을 브랜치 루트에 올린다
@@ -64,7 +65,7 @@ human() {
 }
 
 # ---------- 인자 파싱 ----------
-show_usage() { sed -n '12,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+show_usage() { sed -n '12,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 case "${1:-}" in
   -h|--help|help) show_usage ;;
 esac
@@ -570,6 +571,138 @@ cmd_list() {
   log "전부 올리려면:      ./drivelog.sh upload --profile $PROFILE"
 }
 
+# ---------- 명령: pick (대화형 선택 업로드) ----------
+# 기기의 route 를 업로드 상태와 함께 보여주고 번호로 고르게 한다.
+# 고른 것을 --route 로 넘겨 upload 를 그대로 호출하므로 동작은 upload 와 같다.
+
+# "1,3-5 7" 같은 입력을 번호 목록으로 편다. 범위와 쉼표/공백을 섞어 쓸 수 있다.
+parse_selection() {
+  local input="$1" max="$2" tok a b i
+  input="${input//,/ }"
+  for tok in $input; do
+    case "$tok" in
+      *-*)
+        a="${tok%%-*}"; b="${tok##*-}"
+        case "$a$b" in *[!0-9]*) log "  무시: $tok"; continue ;; esac
+        [ "$a" -le "$b" ] || { i="$a"; a="$b"; b="$i"; }
+        for ((i = a; i <= b; i++)); do
+          [ "$i" -ge 1 ] && [ "$i" -le "$max" ] && printf '%s\n' "$i"
+        done
+        ;;
+      *[!0-9]*) log "  무시: $tok" ;;
+      *)
+        [ "$tok" -ge 1 ] && [ "$tok" -le "$max" ] && printf '%s\n' "$tok" \
+          || log "  범위 밖: $tok"
+        ;;
+    esac
+  done
+}
+
+cmd_pick() {
+  step "프로필 $PROFILE  ->  브랜치 $BRANCH"
+  make_work_repo
+  refresh_tip
+  local kf; kf="$(known_files)"
+
+  [ -n "$SSH_TARGET" ] || die "프로필 '$PROFILE' 에 SSH 대상이 없다."
+  if ! probe_device; then device_err_hint; exit 1; fi
+  log "디바이스 $SSH_TARGET  dongle=$DONGLE"
+  check_dongle "$DONGLE"
+
+  # 기기의 모든 세그먼트를 route 별로 모으되, 각각이 이미 올라갔는지 표시한다.
+  #   route <TAB> seg <TAB> size <TAB> 0(업로드됨)|1(미업로드)
+  local seg sz name
+  : > "$WORK/all.segs"
+  while read -r seg sz; do
+    [ -n "$seg" ] || continue
+    name="$(seg_to_name "$seg" "$DONGLE")"
+    if printf '%s\n' "$kf" | grep -qxF "$name"; then
+      printf '%s\t%s\t%s\t0\n' "$(seg_route "$seg")" "$seg" "${sz:-0}" >> "$WORK/all.segs"
+    else
+      printf '%s\t%s\t%s\t1\n' "$(seg_route "$seg")" "$seg" "${sz:-0}" >> "$WORK/all.segs"
+    fi
+  done < <(device_segments_sized | sort)
+
+  [ -s "$WORK/all.segs" ] || { log "기기에 세그먼트가 없다."; return 0; }
+
+  # route 번호가 큰 것부터 보여준다 (대개 최근 주행이다).
+  # 다만 재빌드로 카운터가 되감기면 이 순서가 시간순과 다를 수 있다.
+  local routes; routes="$(cut -f1 "$WORK/all.segs" | sort -ru)"
+
+  log ""
+  printf '  %-3s %-26s %8s %10s  %s\n' "#" "route" "미업로드" "받을크기" "상태" >&2
+  printf '  %-3s %-26s %8s %10s  %s\n' "---" "--------------------------" "--------" "----------" "--------------------" >&2
+
+  local -a R_NAME=() R_MISS=()
+  local idx=0 r tot n_all n_miss b_miss status
+  local sum_miss=0 sum_bytes=0
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    n_all="$(awk -F'\t' -v x="$r" '$1==x' "$WORK/all.segs" | wc -l)"
+    n_miss="$(awk -F'\t' -v x="$r" '$1==x && $4==1' "$WORK/all.segs" | wc -l)"
+    b_miss="$(awk -F'\t' -v x="$r" '$1==x && $4==1 {s+=$3} END{print s+0}' "$WORK/all.segs")"
+    idx=$((idx + 1))
+    R_NAME[$idx]="$r"
+    R_MISS[$idx]="$n_miss"
+    if [ "$n_miss" -eq 0 ]; then
+      status="업로드 완료"
+      printf '  %-3s %-26s %8s %10s  %s\n' "$idx" "$r" "-" "-" "$status" >&2
+    else
+      if [ "$n_miss" -eq "$n_all" ]; then status="전체 미업로드"
+      else status="일부 업로드 ($((n_all - n_miss))/$n_all)"; fi
+      sum_miss=$((sum_miss + n_miss)); sum_bytes=$((sum_bytes + b_miss))
+      printf '  %-3s %-26s %8s %10s  %s\n' \
+        "$idx" "$r" "$n_miss/$n_all" "$(human "$b_miss")" "$status" >&2
+    fi
+  done <<< "$routes"
+
+  log ""
+  if [ "$sum_miss" -eq 0 ]; then
+    log "미업로드 세그먼트가 없다. 올릴 것이 없다."
+    return 0
+  fi
+  log "미업로드 합계: 세그먼트 $sum_miss 개, $(human "$sum_bytes")"
+  log ""
+
+  local sel
+  # stdin 을 데이터로 쓰지 않으므로 그냥 읽는다.
+  # 대화형은 물론 `echo 1,3 | drivelog.sh pick` 같은 파이프 입력도 그대로 동작한다.
+  printf '올릴 route 번호 (예: 1,3-5 / all / q): ' >&2
+  read -r sel || sel=""
+
+  case "$(printf '%s' "$sel" | tr '[:upper:]' '[:lower:]' | tr -d ' ')" in
+    q|quit|exit|"") log "취소했다."; return 0 ;;
+    a|all)
+      ROUTE_FILTER=""
+      log "전체 미업로드분을 올린다."
+      ;;
+    *)
+      local picked=() i
+      while IFS= read -r i; do
+        [ -n "$i" ] || continue
+        if [ "${R_MISS[$i]}" -eq 0 ]; then
+          log "  건너뜀 [$i] ${R_NAME[$i]} — 이미 전부 올라가 있다"
+          continue
+        fi
+        picked+=("${R_NAME[$i]}")
+      done < <(parse_selection "$sel" "$idx" | sort -un)
+
+      [ ${#picked[@]} -gt 0 ] || { log "선택된 route 가 없다."; return 0; }
+      ROUTE_FILTER="$(printf '%s,' "${picked[@]}")"
+      ROUTE_FILTER="${ROUTE_FILTER%,}"
+      log ""
+      log "선택: ${#picked[@]} 개 route"
+      printf '  %s\n' "${picked[@]}" >&2
+      ;;
+  esac
+
+  # 작업 클론을 정리하고 upload 에 그대로 넘긴다 (upload 가 새로 만든다).
+  rm -rf "$WORK" 2>/dev/null || true
+  WORK=""
+  log ""
+  cmd_upload
+}
+
 # ---------- 명령: upload ----------
 cmd_upload() {
   step "프로필 $PROFILE  ->  브랜치 $BRANCH"
@@ -883,9 +1016,10 @@ cmd_init_order() {
 case "$CMD" in
   status)     cmd_status ;;
   list)       cmd_list ;;
+  pick|i)     cmd_pick ;;
   upload)     cmd_upload ;;
   put)        cmd_put ;;
   prune)      cmd_prune ;;
   init-order) cmd_init_order ;;
-  *)          die "알 수 없는 명령: $CMD (status|list|upload|put|prune|init-order)" ;;
+  *)          die "알 수 없는 명령: $CMD (status|list|pick|upload|put|prune|init-order)" ;;
 esac
