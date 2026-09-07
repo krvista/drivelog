@@ -33,12 +33,33 @@ comma 디바이스의 `rlog.zst` 를 이 리포지토리의 데이터 브랜치�
 
 ## 준비
 
-Git for Windows 의 Git Bash 에서 실행한다. Python 은 필요 없다.
+Git Bash 나 WSL 어느 쪽에서든 실행된다. Python 은 필요 없다.
 
 1. `drivelog.conf` 에서 이 PC 가 실제로 닿는 디바이스 주소를 채운다.
-2. GitHub 자격증명은 Windows 자격 증명 관리자에 저장돼 있으면 된다
-   (`git ls-remote https://github.com/krvista/drivelog.git` 이 물어보지 않고 통과하면 준비 완료).
+2. GitHub 자격증명이 통하는지 확인한다.
+   `git ls-remote https://github.com/krvista/drivelog.git` 이 물어보지 않고 통과하면 준비 완료.
 3. 디바이스는 openpilot 설정에서 SSH 를 켜고 GitHub 사용자명을 등록해 둔다.
+
+### WSL 에서 실행하는 경우
+
+Windows Git Bash 는 자격 증명 관리자를 자동으로 쓰지만 **WSL 은 그렇지 않다.**
+그대로 실행하면 `could not read Username for 'https://github.com'` 로 막힌다.
+아래를 한 번만 실행하면 Windows 쪽에 이미 저장된 자격증명을 그대로 재사용한다.
+새로 로그인하거나 토큰을 따로 만들 필요는 없다.
+
+```bash
+git config --global credential.helper \
+    "/mnt/c/Program\ Files/Git/mingw64/bin/git-credential-manager.exe"
+
+git config --global user.name  "krvista"
+git config --global user.email "krvista@gmail.com"
+```
+
+경로의 `Program\ Files` 는 공백 앞의 역슬래시까지 그대로 넣어야 한다.
+WSL 은 별도의 `~/.gitconfig` 를 쓰므로 커밋 신원도 따로 설정해야 한다.
+
+참고로 `git@github.com` SSH 경로는 이 계정에 공개키가 등록돼 있지 않아 지금은 쓸 수 없다
+(`Permission denied (publickey)`). HTTPS + 자격 증명 관리자 조합을 쓴다.
 
 ## 사용법
 

@@ -100,6 +100,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# GitHub 인증이 안 될 때 안내. WSL 에서 특히 자주 걸린다.
+# Windows Git Bash 는 자격 증명 관리자를 자동으로 쓰지만 WSL 은 그렇지 않다.
+auth_hint() {
+  log "error: 클론 실패: $REMOTE_URL ($BRANCH)"
+  log ""
+  if grep -qi microsoft /proc/version 2>/dev/null; then
+    log "WSL 에서는 Windows 자격 증명 관리자가 자동으로 연결되지 않는다."
+    log "아래를 한 번 실행하면 Windows 쪽에 이미 저장된 자격증명을 그대로 쓴다:"
+    log ""
+    log '  git config --global credential.helper \\'
+    log '      "/mnt/c/Program\\ Files/Git/mingw64/bin/git-credential-manager.exe"'
+    log ""
+    log "커밋 신원도 함께 설정해 둘 것:"
+    log '  git config --global user.name  "krvista"'
+    log '  git config --global user.email "krvista@gmail.com"'
+  else
+    log "다음이 물어보지 않고 통과하는지 확인할 것:"
+    log "  git ls-remote $REMOTE_URL"
+  fi
+  exit 1
+}
+
 # ---------- 1. 메타데이터만 있는 일회용 클론 ----------
 # 받아오는 것: 커밋 1개 + 트리 + 루트의 작은 파일들. 데이터 blob 은 0 바이트.
 make_work_repo() {
@@ -108,7 +130,7 @@ make_work_repo() {
     --filter=blob:limit=64k --no-checkout --depth 1 \
     --single-branch --branch "$BRANCH" \
     "$REMOTE_URL" "$WORK/repo" \
-    || die "클론 실패: $REMOTE_URL ($BRANCH). 자격증명을 확인할 것."
+    || auth_hint
   mkdir -p "$WORK/stage"
   G=(git -C "$WORK/repo")
 }
