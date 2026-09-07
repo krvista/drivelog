@@ -61,6 +61,32 @@ WSL 은 별도의 `~/.gitconfig` 를 쓰므로 커밋 신원도 따로 설정해
 참고로 `git@github.com` SSH 경로는 이 계정에 공개키가 등록돼 있지 않아 지금은 쓸 수 없다
 (`Permission denied (publickey)`). HTTPS + 자격 증명 관리자 조합을 쓴다.
 
+### 디바이스 SSH 키
+
+comma 기기는 **GitHub 계정에 등록된 공개키**를 받아와 SSH 인증에 쓴다.
+따라서 업로드 PC 의 키가 GitHub 계정에 등록돼 있어야 기기에 접속할 수 있다.
+
+```bash
+ssh-keygen -lf ~/.ssh/id_ed25519.pub          # 이 PC 의 키
+curl -s https://github.com/krvista.keys | ssh-keygen -lf -   # GitHub 에 등록된 키
+```
+
+두 지문이 다르면 이 PC 의 공개키를 GitHub 계정 SSH keys 에 추가하고,
+openpilot 설정에서 GitHub 사용자명을 다시 입력해 기기 쪽 키 목록을 갱신한다.
+
+2026-09-07 기준 이 PC 는 지문이 어긋나 있다. 기기(`192.168.1.31`)는 응답하지만
+`Permission denied (publickey)` 로 막힌다. `status` 가 이 상황을 구분해서 알려준다.
+
+### 차를 잘못 지정하는 사고 막기
+
+차가 두 대인데 스크립트는 하나이므로, 프로필을 잘못 주면 CCNC 데이터가
+wk2 브랜치로 들어갈 수 있다. `drivelog.conf` 의 `PROFILE_DONGLE` 을 채워 두면
+기기의 실제 dongle 과 대조해서 다를 경우 업로드를 거부한다.
+
+`ccnc` 는 `5494f8f29b7fd585` 로 채워져 있다 (브랜치에 이미 올라간 525개 파일의 dongle).
+`wk2` 는 아직 기기에 접속한 적이 없어 비어 있다. 처음 접속에 성공하면 `status` 가
+실제 dongle 을 알려주므로 그 값을 넣어두면 된다.
+
 ## 사용법
 
 ```bash
@@ -78,6 +104,9 @@ WSL 은 별도의 `~/.gitconfig` 를 쓰므로 커밋 신원도 따로 설정해
 
 # 이미 PC 에 받아둔 폴더에서 업로드
 ./drivelog.sh upload --profile wk2 --from-dir /d/rlog_backup
+
+# 설정을 고치지 않고 기기 주소만 바꿔서 실행
+./drivelog.sh status --profile wk2 --host 192.168.1.31
 
 # 스크립트 같은 일반 파일을 브랜치 루트에 올림
 ./drivelog.sh put --profile ccnc drivelog.sh TOOLING.md

@@ -33,8 +33,13 @@ BATCH_FILES=12
 PUSH_RETRIES=10
 PROFILE="ccnc"
 FORCE_BRANCH=""
+FORCE_HOST=""
 
-declare -A PROFILE_SSH PROFILE_BRANCH
+# PROFILE_DONGLE 은 선택 사항이지만 채워 두는 편이 안전하다.
+# 차가 두 대인데 스크립트가 하나이므로, 프로필을 잘못 지정하면
+# CCNC 데이터가 wk2 브랜치로 들어가는 식의 사고가 난다.
+# 값이 설정돼 있으면 기기의 실제 dongle 과 대조해 다르면 중단한다.
+declare -A PROFILE_SSH PROFILE_BRANCH PROFILE_DONGLE
 PROFILE_SSH[ccnc]="comma@192.168.1.135"
 PROFILE_BRANCH[ccnc]="ccnc-drivelog"
 PROFILE_SSH[wk2]=""
@@ -69,6 +74,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --profile)  PROFILE="$2"; shift 2 ;;
     --branch)   FORCE_BRANCH="$2"; shift 2 ;;
+    --host)     FORCE_HOST="$2"; shift 2 ;;
     --limit)    LIMIT="$2"; shift 2 ;;
     --batch)    BATCH_FILES="$2"; shift 2 ;;
     --from-dir) FROM_DIR="$2"; shift 2 ;;
@@ -86,7 +92,35 @@ if [ -n "$FORCE_BRANCH" ]; then
 else
   BRANCH="${PROFILE_BRANCH[$PROFILE]:-}"
 fi
-SSH_TARGET="${PROFILE_SSH[$PROFILE]:-}"
+if [ -n "$FORCE_HOST" ]; then
+  case "$FORCE_HOST" in
+    *@*) SSH_TARGET="$FORCE_HOST" ;;
+    *)   SSH_TARGET="comma@$FORCE_HOST" ;;
+  esac
+else
+  SSH_TARGET="${PROFILE_SSH[$PROFILE]:-}"
+fi
+EXPECT_DONGLE="${PROFILE_DONGLE[$PROFILE]:-}"
+
+# 기기의 dongle 이 이 프로필에 기대되는 값과 다르면 중단한다.
+# 다른 차의 데이터를 엉뚱한 브랜치에 올리는 사고를 막기 위한 것이다.
+check_dongle() {
+  local got="$1"
+  if [ -z "$EXPECT_DONGLE" ]; then
+    log "  (프로필 '$PROFILE' 에 기대 dongle 이 설정돼 있지 않다."
+    log "   drivelog.conf 에 PROFILE_DONGLE[$PROFILE]=\"$got\" 를 넣어두면"
+    log "   다음부터 차를 잘못 지정하는 사고를 막을 수 있다.)"
+    return 0
+  fi
+  if [ "$got" != "$EXPECT_DONGLE" ]; then
+    log ""
+    log "기기의 dongle 이 이 프로필과 맞지 않는다. 중단한다."
+    log "  프로필 $PROFILE 기대값 : $EXPECT_DONGLE  -> $BRANCH"
+    log "  실제 기기            : $got"
+    log "다른 차의 기기이거나 프로필을 잘못 지정했을 수 있다."
+    exit 1
+  fi
+}
 [ -n "$BRANCH" ] || die "프로필 '$PROFILE' 에 대한 브랜치를 찾을 수 없다."
 
 WORK=""
@@ -166,9 +200,65 @@ known_files() {
 }
 
 # ---------- 2. 디바이스 인벤토리 ----------
-device_dongle() {
-  ssh -o BatchMode=yes -o ConnectTimeout=8 "$SSH_TARGET" \
-    'cat /data/params/d/DongleId 2>/dev/null' 2>/dev/null | tr -d '\r\n'
+# 실패 원인을 구분해서 알려준다. "안 닿는다" 와 "키가 거부됐다" 는
+# 대응이 완전히 다른데 뭉뚱그리면 엉뚱한 곳을 뒤지게 된다.
+#
+# 주의: 명령 치환($(...)) 안에서 전역을 설정하면 서브셸이라 밖으로 전달되지 않는다.
+# 그래서 결과를 반환하지 않고 DONGLE / DEVICE_ERR 전역에 직접 넣는다.
+DEVICE_ERR=""
+DONGLE=""
+probe_device() {
+  local out rc
+  DEVICE_ERR=""
+  DONGLE=""
+  out="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 \
+        "$SSH_TARGET" 'cat /data/params/d/DongleId 2>/dev/null' 2>&1)" && rc=0 || rc=$?
+
+  if [ "$rc" -eq 0 ]; then
+    DONGLE="$(printf '%s' "$out" | tr -d '\r\n')"
+    [ -n "$DONGLE" ] || { DEVICE_ERR="DongleId 를 읽지 못했다"; return 1; }
+    return 0
+  fi
+
+  case "$out" in
+    *"Permission denied (publickey)"*)
+      DEVICE_ERR="키거부" ;;
+    *"Connection refused"*)
+      DEVICE_ERR="SSH 꺼짐" ;;
+    *"Connection timed out"*|*"No route to host"*|*"Host is down"*)
+      DEVICE_ERR="안닿음" ;;
+    *)
+      DEVICE_ERR="$(printf '%s' "$out" | tr -d '\r' | tail -1)" ;;
+  esac
+  return 1
+}
+
+# 위 실패 원인에 맞는 안내를 출력한다.
+device_err_hint() {
+  case "$DEVICE_ERR" in
+    "키거부")
+      log "디바이스      : $SSH_TARGET 응답하지만 공개키가 거부됐다"
+      log ""
+      log "  comma 기기는 GitHub 계정에 등록된 공개키로 SSH 를 인증한다."
+      log "  이 PC 의 키가 GitHub 계정에 등록돼 있는지 확인할 것:"
+      log ""
+      log "    ssh-keygen -lf ~/.ssh/id_ed25519.pub"
+      log "    curl -s https://github.com/krvista.keys | ssh-keygen -lf -"
+      log ""
+      log "  두 지문이 다르면 이 PC 의 공개키를 GitHub 계정에 추가한 뒤,"
+      log "  openpilot 설정에서 GitHub 사용자명을 다시 입력해 키를 갱신해야 한다."
+      ;;
+    "SSH 꺼짐")
+      log "디바이스      : $SSH_TARGET 응답하지만 SSH 가 꺼져 있다"
+      log "  openpilot 설정에서 SSH 를 켤 것."
+      ;;
+    "안닿음")
+      log "디바이스      : $SSH_TARGET 에 닿지 않는다 (지금은 다른 네트워크일 수 있다)"
+      ;;
+    *)
+      log "디바이스      : $SSH_TARGET 접속 실패 - $DEVICE_ERR"
+      ;;
+  esac
 }
 
 # 세그먼트 디렉터리명을 리포지토리 파일명으로 바꾼다.
@@ -313,12 +403,13 @@ cmd_status() {
   fi
 
   local dongle
-  dongle="$(device_dongle || true)"
-  if [ -z "$dongle" ]; then
-    log "디바이스      : $SSH_TARGET 접속 불가 (지금은 다른 네트워크일 수 있다)"
+  if ! probe_device; then
+    device_err_hint
     return 0
   fi
+  dongle="$DONGLE"
   log "디바이스      : $SSH_TARGET  dongle=$dongle"
+  check_dongle "$dongle"
 
   local segs missing=0 s name n_seg
   segs="$(device_segments)"
@@ -357,9 +448,13 @@ cmd_upload() {
   else
     [ -n "$SSH_TARGET" ] || die "프로필 '$PROFILE' 에 SSH 대상이 없다. drivelog.conf 확인."
     local dongle
-    dongle="$(device_dongle || true)"
-    [ -n "$dongle" ] || die "디바이스 $SSH_TARGET 에 접속할 수 없다."
+    if ! probe_device; then
+      device_err_hint
+      exit 1
+    fi
+    dongle="$DONGLE"
     log "디바이스 $SSH_TARGET  dongle=$dongle"
+    check_dongle "$dongle"
     local s name
     while IFS= read -r s; do
       [ -n "$s" ] || continue
