@@ -20,6 +20,7 @@ PUSH_RETRIES=10
 # 값이 있으면 기기의 실제 dongle 과 대조해서 다르면 업로드를 거부한다.
 # 차가 두 대이므로 프로필을 잘못 지정해 엉뚱한 브랜치에 올리는 사고를 막아준다.
 
+# 192.168.1.31 = C4-CE1N 기기 (ccnc-drivelog)
 PROFILE_SSH[ccnc]="comma@192.168.1.31"
 PROFILE_BRANCH[ccnc]="ccnc-drivelog"
 PROFILE_DONGLE[ccnc]="5494f8f29b7fd585"
