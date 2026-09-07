@@ -10,10 +10,12 @@
 #     로컬 상태 파일이 없으므로 PC 간 상태 불일치가 원리적으로 발생하지 않는다.
 #
 # 사용법:
-#   ./drivelog.sh status  [--profile ccnc|wk2]
-#   ./drivelog.sh upload  [--profile ccnc|wk2] [--limit N] [--batch N] [--dry-run]
-#   ./drivelog.sh upload  --from-dir <디렉터리>   # 이미 받아둔 로컬 파일을 올린다
+#   ./drivelog.sh status [--profile ccnc|wk2]
+#   ./drivelog.sh list   [--profile ccnc|wk2]     # 미업로드분을 route 별로 보여준다
+#   ./drivelog.sh upload [--profile ccnc|wk2] [--route R[,R2]] [--limit N] [--dry-run]
+#   ./drivelog.sh upload --from-dir <디렉터리>    # 이미 받아둔 로컬 파일을 올린다
 #   ./drivelog.sh put <파일>...                   # 임의 파일을 브랜치 루트에 올린다
+#   ./drivelog.sh prune  [--keep N] [--yes]       # 오래된 route 를 브랜치에서 덜어낸다
 
 set -euo pipefail
 
@@ -66,6 +68,7 @@ shift || true
 LIMIT=0
 DRY_RUN=0
 FROM_DIR=""
+ROUTE_FILTER=""
 KEEP_ROUTES=5
 PRUNE_YES=0
 PUT_PATHS=()
@@ -78,6 +81,7 @@ while [ $# -gt 0 ]; do
     --limit)    LIMIT="$2"; shift 2 ;;
     --batch)    BATCH_FILES="$2"; shift 2 ;;
     --from-dir) FROM_DIR="$2"; shift 2 ;;
+    --route)    ROUTE_FILTER="$2"; shift 2 ;;
     --keep)     KEEP_ROUTES="$2"; shift 2 ;;
     --yes)      PRUNE_YES=1; shift ;;
     --dry-run)  DRY_RUN=1; shift ;;
@@ -278,6 +282,17 @@ device_segments() {
     2>/dev/null | tr -d '\r'
 }
 
+# 세그먼트와 파일 크기를 한 번의 ssh 로 같이 가져온다. "<세그먼트> <바이트>" 형식.
+device_segments_sized() {
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_TARGET" \
+    "cd '$DEVICE_DATA_DIR' 2>/dev/null || exit 0; for d in */; do d=\${d%/}; f=\"\$d/rlog.zst\"; if [ -f \"\$f\" ]; then echo \"\$d \$(stat -c %s \"\$f\" 2>/dev/null || echo 0)\"; fi; done" \
+    2>/dev/null | tr -d '\r'
+}
+
+# 세그먼트 디렉터리명에서 route 부분만 떼어낸다.
+#   5494f8f29b7fd585|00000061--4fb2eee4c0--5  ->  5494f8f29b7fd585|00000061--4fb2eee4c0
+seg_route() { printf '%s' "${1%--*}"; }
+
 # ---------- 3. plumbing 으로 커밋을 만들어 push ----------
 # 인덱스도 워킹트리도 쓰지 않는다.
 #
@@ -425,6 +440,77 @@ cmd_status() {
   log "미업로드      : $missing"
 }
 
+# --route 로 넘어온 값 중 하나라도 route 이름에 들어 있으면 통과.
+# 쉼표로 여러 개를 줄 수 있고, 전체 이름 대신 일부만 줘도 된다 (예: 00000061).
+route_matches() {
+  local route="$1" pat
+  [ -n "$ROUTE_FILTER" ] || return 0
+  local IFS=,
+  for pat in $ROUTE_FILTER; do
+    [ -n "$pat" ] || continue
+    case "$route" in *"$pat"*) return 0 ;; esac
+  done
+  return 1
+}
+
+# ---------- 명령: list (아직 안 올라간 것을 route 별로 보여준다) ----------
+cmd_list() {
+  step "프로필 $PROFILE  ->  브랜치 $BRANCH"
+  make_work_repo
+  refresh_tip
+  local kf; kf="$(known_files)"
+
+  [ -n "$SSH_TARGET" ] || die "프로필 '$PROFILE' 에 SSH 대상이 없다."
+  if ! probe_device; then device_err_hint; exit 1; fi
+  log "디바이스 $SSH_TARGET  dongle=$DONGLE"
+  log ""
+
+  # 미업로드 세그먼트를 route 별로 모은다.
+  local line seg sz name route
+  : > "$WORK/missing"
+  while read -r seg sz; do
+    [ -n "$seg" ] || continue
+    name="$(seg_to_name "$seg" "$DONGLE")"
+    printf '%s\n' "$kf" | grep -qxF "$name" && continue
+    printf '%s\t%s\t%s\n' "$(seg_route "$seg")" "$seg" "${sz:-0}" >> "$WORK/missing"
+  done < <(device_segments_sized | sort)
+
+  if [ ! -s "$WORK/missing" ]; then
+    log "미업로드 세그먼트가 없다."
+    return 0
+  fi
+
+  printf '  %-3s %-34s %5s %10s\n' "#" "route" "seg" "크기" >&2
+  printf '  %-3s %-34s %5s %10s\n' "---" "----------------------------------" "-----" "----------" >&2
+
+  local idx=0 tot_n=0 tot_b=0 first_route="" last_route=""
+  while IFS= read -r route; do
+    idx=$((idx + 1))
+    [ -z "$first_route" ] && first_route="${route#*|}"
+    last_route="${route#*|}"
+    local n b
+    n="$(awk -F'\t' -v r="$route" '$1==r' "$WORK/missing" | wc -l)"
+    b="$(awk -F'\t' -v r="$route" '$1==r {s+=$3} END{print s+0}' "$WORK/missing")"
+    tot_n=$((tot_n + n)); tot_b=$((tot_b + b))
+    # route 이름에서 dongle 접두사는 빼고 보여준다 (모두 같아서 자리만 차지한다).
+    printf '  %-3s %-34s %5s %10s\n' "$idx" "${route#*|}" "$n" "$(human "$b")" >&2
+  done < <(cut -f1 "$WORK/missing" | sort -u)
+
+  log ""
+  log "합계: route $idx 개, 세그먼트 $tot_n 개, $(human "$tot_b")"
+  log ""
+  log "올릴 route 를 골라서 실행한다 (이름 일부만 줘도 된다, 쉼표로 여러 개):"
+  log ""
+  log "  ./drivelog.sh upload --profile $PROFILE --route ${first_route%%--*} --dry-run"
+  log "  ./drivelog.sh upload --profile $PROFILE --route ${first_route%%--*}"
+  if [ "$idx" -gt 1 ]; then
+    log "  ./drivelog.sh upload --profile $PROFILE --route ${first_route%%--*},${last_route%%--*}"
+  fi
+  log ""
+  log "일부만 시험하려면:  ./drivelog.sh upload --profile $PROFILE --limit 3"
+  log "전부 올리려면:      ./drivelog.sh upload --profile $PROFILE"
+}
+
 # ---------- 명령: upload ----------
 cmd_upload() {
   step "프로필 $PROFILE  ->  브랜치 $BRANCH"
@@ -442,6 +528,7 @@ cmd_upload() {
     while IFS= read -r f; do
       b="$(basename "$f")"
       if printf '%s\n' "$kf" | grep -qxF "$b"; then continue; fi
+      route_matches "$(route_of "$b")" || continue
       todo_name+=("$b")
       todo_src+=("local:$f")
     done < <(find "$FROM_DIR" -type f -name '*rlog.zst' | sort)
@@ -455,21 +542,30 @@ cmd_upload() {
     dongle="$DONGLE"
     log "디바이스 $SSH_TARGET  dongle=$dongle"
     check_dongle "$dongle"
-    local s name
-    while IFS= read -r s; do
+    local s sz name todo_bytes=0
+    while read -r s sz; do
       [ -n "$s" ] || continue
       name="$(seg_to_name "$s" "$dongle")"
       if printf '%s\n' "$kf" | grep -qxF "$name"; then continue; fi
+      route_matches "$(seg_route "$s")" || continue
       todo_name+=("$name")
       todo_src+=("ssh:$s")
-    done < <(device_segments | sort)
+      todo_bytes=$((todo_bytes + ${sz:-0}))
+    done < <(device_segments_sized | sort)
+    [ "$todo_bytes" -gt 0 ] && log "받아올 총 용량: $(human "$todo_bytes")"
   fi
 
   local total=${#todo_name[@]}
   if [ "$total" -eq 0 ]; then
-    log "새로 올릴 파일이 없다."
+    if [ -n "$ROUTE_FILTER" ]; then
+      log "--route '$ROUTE_FILTER' 에 해당하는 새 파일이 없다."
+      log "  ./drivelog.sh list --profile $PROFILE  로 올릴 수 있는 route 를 확인할 것."
+    else
+      log "새로 올릴 파일이 없다."
+    fi
     return 0
   fi
+  [ -n "$ROUTE_FILTER" ] && log "--route '$ROUTE_FILTER' 적용"
   if [ "$LIMIT" -gt 0 ] && [ "$LIMIT" -lt "$total" ]; then
     total="$LIMIT"
     log "--limit $LIMIT 적용"
@@ -636,8 +732,9 @@ cmd_prune() {
 
 case "$CMD" in
   status) cmd_status ;;
+  list)   cmd_list ;;
   upload) cmd_upload ;;
   put)    cmd_put ;;
   prune)  cmd_prune ;;
-  *)      die "알 수 없는 명령: $CMD (status|upload|put|prune)" ;;
+  *)      die "알 수 없는 명령: $CMD (status|list|upload|put|prune)" ;;
 esac
