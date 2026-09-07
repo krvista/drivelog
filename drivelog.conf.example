@@ -16,8 +16,14 @@ PUSH_RETRIES=10
 # SSH 주소는 네트워크마다 다르다. 이 PC 에서 실제로 닿는 값으로 채울 것.
 # 집과 회사에서 주소가 다르면 프로필을 나눠도 된다.
 
-PROFILE_SSH[ccnc]="comma@192.168.1.135"
-PROFILE_BRANCH[ccnc]="ccnc-drivelog"
+# PROFILE_DONGLE 은 선택 사항이지만 채워 두는 편이 안전하다.
+# 값이 있으면 기기의 실제 dongle 과 대조해서 다르면 업로드를 거부한다.
+# 차가 두 대이므로 프로필을 잘못 지정해 엉뚱한 브랜치에 올리는 사고를 막아준다.
 
-PROFILE_SSH[wk2]="comma@192.168.1.136"
+PROFILE_SSH[ccnc]="comma@192.168.1.31"
+PROFILE_BRANCH[ccnc]="ccnc-drivelog"
+PROFILE_DONGLE[ccnc]="5494f8f29b7fd585"
+
+PROFILE_SSH[wk2]=""
 PROFILE_BRANCH[wk2]="wk2-drivelog"
+PROFILE_DONGLE[wk2]=""
