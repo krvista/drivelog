@@ -14,8 +14,11 @@ bash drivelog.sh status --profile ccnc   # 원격/기기 파일 수
 bash drivelog.sh list   --profile ccnc   # 아직 안 올라간 것 (route 별)
 ```
 
-작성 시점 기준으로는 `ccnc-drivelog` 에 525개, 기기에 미업로드 38개(route
-`00000005--e1271d2b50`, 483 MB)가 있었고 아직 올리지 않은 상태였다.
+작성 시점 기준으로 `ccnc-drivelog` 에 563개 파일이 있다. 2026-09-06 밤 빌드 후
+첫 출근길 주행분인 route `00000005--e1271d2b50` 의 38개(483 MB)를 이 세션에서 올려
+기존 525개에 더해진 결과다. 기기에 남은 미업로드는 없었다.
+
+`wk2-drivelog` 에는 아직 데이터가 없다 (도구 파일만 있다).
 
 ## 이번 세션에서 한 일
 
