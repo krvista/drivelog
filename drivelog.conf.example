@@ -2,11 +2,19 @@
 # 이 파일을 drivelog.conf 로 복사한 뒤 이 PC 에 맞게 고친다.
 # drivelog.conf 는 PC 마다 다르므로 리포지토리에 올리지 않는다.
 
+# 원격 주소는 이 PC 가 GitHub 에 어떻게 인증하느냐에 따라 고른다.
+#   HTTPS : 자격 증명 관리자에 토큰이 저장돼 있을 때. WSL 이면 TOOLING.md 의 WSL 절 참고.
+#   SSH   : 이 PC 의 공개키가 GitHub 계정에 등록돼 있을 때. 별도 설정이 필요 없다.
 REMOTE_URL="https://github.com/krvista/drivelog.git"
+#REMOTE_URL="git@github.com:krvista/drivelog.git"
+
 DEVICE_DATA_DIR="/data/media/0/realdata"
 REPO_SUBDIR="drivelog"
 
-# 한 커밋(=한 push)에 담을 파일 수. rlog.zst 는 개당 약 11 MB.
+# 한 커밋(=한 push)에 담을 파일 수. rlog.zst 는 개당 약 11 MB 이므로
+# 12 개면 push 당 약 130 MB 다.
+# 회선이 불안정해 대용량 push 가 중간에 끊기면 낮출 것. 4 개면 약 45 MB 다.
+# 명령줄에서 --batch 로도 덮어쓸 수 있다.
 BATCH_FILES=12
 
 # push 충돌 시 재시도 횟수 (두 PC 가 동시에 올릴 때 쓰인다).
@@ -20,6 +28,8 @@ PUSH_RETRIES=10
 # 값이 있으면 기기의 실제 dongle 과 대조해서 다르면 업로드를 거부한다.
 # 차가 두 대이므로 프로필을 잘못 지정해 엉뚱한 브랜치에 올리는 사고를 막아준다.
 
+# 기기 IP 는 네트워크마다 다르다. 아래는 회사 네트워크 기준 값이므로
+# 집에서는 고쳐 쓰거나 --host 로 덮어쓸 것.
 # 192.168.1.31 = C4-CE1N 기기 (ccnc-drivelog)
 PROFILE_SSH[ccnc]="comma@192.168.1.31"
 PROFILE_BRANCH[ccnc]="ccnc-drivelog"

@@ -18,6 +18,7 @@
 #   ./drivelog.sh put <파일>...                   # 임의 파일을 브랜치 루트에 올린다
 #   ./drivelog.sh prune  [--keep N] [--yes]       # 오래된 route 를 브랜치에서 덜어낸다
 #   ./drivelog.sh init-order [--dry-run] [--yes]  # 업로드 순서 원장을 히스토리에서 복원(1회)
+#   ./drivelog.sh sync   [--profile ccnc|wk2]     # 브랜치의 도구 사본으로 이 PC 를 맞춘다
 
 set -euo pipefail
 
@@ -65,7 +66,7 @@ human() {
 }
 
 # ---------- 인자 파싱 ----------
-show_usage() { sed -n '12,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+show_usage() { sed -n '12,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 case "${1:-}" in
   -h|--help|help) show_usage ;;
 esac
@@ -183,6 +184,64 @@ make_work_repo() {
 refresh_tip() {
   "${G[@]}" fetch --quiet --depth 1 --filter=blob:limit=64k origin "$BRANCH"
   BASE="$("${G[@]}" rev-parse FETCH_HEAD)"
+  check_tool_version
+}
+
+# 이 PC 의 스크립트가 브랜치의 것과 같은지 본다.
+#
+# 데이터의 상태는 원격만 보면 되지만 도구 자체는 각 PC 에 복사본으로 존재한다.
+# 그래서 도구만은 낡을 수 있고, 낡은 사본은 조용히 기능을 빠뜨린다.
+# 2026-09-08 실제로 그랬다. 회사 PC 의 사본이 order.txt 를 모르던 판이라
+# route 00000007 을 올리면서 원장을 갱신하지 않았고, prune 이 그 route 를
+# "원장에 없음 = 가장 오래됨" 으로 취급할 뻔했다.
+TOOL_CHECKED=0
+check_tool_version() {
+  [ "$TOOL_CHECKED" -eq 0 ] || return 0
+  TOOL_CHECKED=1
+  # put/sync 는 도구를 일부러 바꾸는 명령이라 경고가 의미 없다.
+  case "$CMD" in put|sync) return 0 ;; esac
+
+  local remote_blob local_blob
+  remote_blob="$("${G[@]}" rev-parse -q --verify "$BASE:drivelog.sh" 2>/dev/null || true)"
+  [ -n "$remote_blob" ] || return 0
+  local_blob="$(git hash-object -- "$SCRIPT_DIR/drivelog.sh" 2>/dev/null || true)"
+  [ -n "$local_blob" ] || return 0
+  [ "$remote_blob" = "$local_blob" ] && return 0
+
+  log ""
+  log "주의: 이 PC 의 drivelog.sh 가 브랜치의 것과 다르다."
+  log "      낡은 사본이면 기능이 빠진 채로 동작한다 (원장 갱신 누락 등)."
+  log "      브랜치 사본으로 맞추려면:  ./drivelog.sh sync --profile $PROFILE"
+  log ""
+}
+
+# ---------- 명령: sync (브랜치의 도구 사본으로 이 PC 를 맞춘다) ----------
+cmd_sync() {
+  step "프로필 $PROFILE  ->  브랜치 $BRANCH"
+  make_work_repo
+  refresh_tip
+
+  local f blob local_blob n=0
+  for f in drivelog.sh TOOLING.md HANDOFF.md README.md drivelog.conf.example drivelog.cmd; do
+    blob="$("${G[@]}" rev-parse -q --verify "$BASE:$f" 2>/dev/null || true)"
+    [ -n "$blob" ] || continue
+    local_blob="$(git hash-object -- "$SCRIPT_DIR/$f" 2>/dev/null || echo none)"
+    if [ "$blob" = "$local_blob" ]; then
+      log "  같음   $f"
+      continue
+    fi
+    # 실행 중인 자기 자신을 직접 덮어쓰면 bash 가 남은 부분을 잘못 읽을 수 있다.
+    # 임시 파일에 받아서 통째로 바꾼다.
+    "${G[@]}" cat-file -p "$BASE:$f" > "$SCRIPT_DIR/$f.new"
+    mv -f "$SCRIPT_DIR/$f.new" "$SCRIPT_DIR/$f"
+    case "$f" in *.sh) chmod +x "$SCRIPT_DIR/$f" ;; esac
+    log "  갱신   $f"
+    n=$((n + 1))
+  done
+
+  step "완료. $n 개 파일을 브랜치 사본으로 맞췄다."
+  [ "$n" -gt 0 ] && log "drivelog.conf 는 PC 마다 다르므로 건드리지 않는다."
+  return 0
 }
 
 # 원격에 이미 올라간 파일 목록 = 유일한 상태 저장소.
@@ -464,6 +523,18 @@ cmd_status() {
   log "원격 tip      : $(printf '%s' "$BASE" | cut -c1-8)  $("${G[@]}" log -1 --format=%s "$BASE")"
   log "원격 파일 수  : $n_remote"
   [ "$n_pruned" -gt 0 ] && log "정리 완료     : $n_pruned (pruned.txt, 다시 올리지 않는다)"
+
+  # 업로드 순서 원장은 prune 이 "무엇이 오래된 것인가" 를 판단하는 유일한 근거다.
+  # 비어 있으면 prune 이 이름순으로 되돌아가므로 여기서 미리 알려준다.
+  local n_order
+  n_order="$(order_list | count_lines)"
+  if [ "$n_order" -gt 0 ]; then
+    log "업로드 순서   : route $n_order 개 기록됨 (order.txt, prune 의 정렬 기준)"
+  else
+    log "업로드 순서   : 기록 없음 - prune 이 이름순으로 되돌아간다"
+    log "                기기 재빌드로 route 번호가 되감기면 최신 주행이 먼저 지워진다."
+    log "                히스토리에서 복원할 것: ./drivelog.sh init-order --profile $PROFILE"
+  fi
   if [ "$n_remote" -gt 0 ]; then
     # 이름 순일 뿐 시간 순이 아니다. 기기를 다시 빌드하면 route 카운터가
     # 0 부터 다시 시작하므로 "가장 오래됨/최근" 으로 읽으면 틀린다.
@@ -948,7 +1019,23 @@ cmd_prune() {
 
   commit="$("${G[@]}" commit-tree "$root" -p "$BASE" -m "drivelog: prune, keep newest $KEEP_ROUTES route(s)")"
   [ -n "$commit" ] || die "커밋 생성 실패"
-  "${G[@]}" push --quiet --no-thin origin "$commit:refs/heads/$BRANCH" || die "push 실패"
+
+  # upload 와 달리 여기서는 재시도하지 않는다. 일부러 그렇게 뒀다.
+  # prune 은 "$BASE 시점의 파일 목록에서 무엇을 남길지" 를 미리 정해 서브트리를 만든다.
+  # 그 사이 다른 PC 가 새 파일을 올렸다면, 그 파일은 keep 목록에 없으므로
+  # 새 tip 위에 그대로 다시 쌓으면 방금 올라온 데이터를 지워버린다.
+  # 그래서 갱신된 tip 을 보고 처음부터 다시 판단하도록 중단한다.
+  if ! "${G[@]}" push --quiet --no-thin origin "$commit:refs/heads/$BRANCH" 2>"$WORK/push.err"; then
+    if grep -qiE 'non-fast-forward|fetch first|stale info|cannot lock ref|failed to lock' "$WORK/push.err"; then
+      log ""
+      log "push 거부됨. 그 사이 브랜치가 움직였다 (다른 PC 가 올렸을 수 있다)."
+      log "지금 계산한 유지 목록은 낡았으므로 그대로 밀어넣지 않고 중단한다."
+      log "다시 실행하면 새 상태를 기준으로 다시 판단한다."
+      exit 1
+    fi
+    cat "$WORK/push.err" >&2
+    die "push 실패"
+  fi
   step "완료. $n_drop 개 파일을 브랜치에서 덜어냈다 (히스토리에는 남아 있다)."
 }
 
@@ -1021,5 +1108,6 @@ case "$CMD" in
   put)        cmd_put ;;
   prune)      cmd_prune ;;
   init-order) cmd_init_order ;;
-  *)          die "알 수 없는 명령: $CMD (status|list|pick|upload|put|prune|init-order)" ;;
+  sync)       cmd_sync ;;
+  *)          die "알 수 없는 명령: $CMD (status|list|pick|upload|put|prune|init-order|sync)" ;;
 esac
