@@ -10,9 +10,13 @@
 아래를 먼저 돌려서 실제 상태를 확인할 것.
 
 ```bash
+bash drivelog.sh sync   --profile ccnc   # 먼저 이 PC 의 도구를 브랜치 사본으로 맞춘다
 bash drivelog.sh status --profile ccnc   # 원격/기기 파일 수
 bash drivelog.sh list   --profile ccnc   # 아직 안 올라간 것 (route 별)
 ```
+
+다른 PC 에서 작업하다 왔으면 `sync` 부터 돌릴 것. 도구 사본이 낡으면 조용히
+기능이 빠진 채로 동작한다 (2026-09-08 실제로 겪었다).
 
 `wk2-drivelog` 에는 아직 데이터가 없다 (도구 파일만 있다).
 
@@ -35,6 +39,26 @@ bash drivelog.sh list   --profile ccnc   # 아직 안 올라간 것 (route 별)
 **prune 정렬 문제를 해결했다** (아래 "해결된 과제" 참고). `init-order` 서브커맨드가 추가됐다.
 
 집 PC 쪽 환경 차이를 `drivelog.conf` 에 반영했다. 회사 PC 설정은 건드리지 않았다.
+
+### 회사 PC 세션 (2026-09-08 오전)
+
+집에서 갱신한 문서와 코드를 읽고 나머지를 거기에 맞췄다.
+
+- `TOOLING.md` 가 아직 "prune 정렬 기준 (미해결)" 이라고 적고 있어 이 문서와
+  정면으로 어긋났다. `order.txt` 설계로 다시 썼고 `pick` / `init-order` / `sync` 를 채웠다.
+- `README.md` 가 사라진 Python 스크립트 세 개를 계속 안내하고 있었다. 새로 썼다.
+- `drivelog.conf.example` 에 SSH 원격 선택지와 `BATCH_FILES` 조정 지침을 넣었다.
+- `status` 가 원장 상태를 보여준다. 비어 있으면 `init-order` 를 안내한다.
+- `prune` 은 push 거부 시 재시도하지 않고 중단하도록 명시했다. 유지 목록을
+  `$BASE` 시점으로 미리 정하므로, 그 사이 올라온 파일을 모른 채 다시 쌓으면
+  그 파일을 지워버린다. 다시 실행해 처음부터 판단하는 편이 안전하다.
+
+**낡은 도구 사본 사고를 하나 발견해 고쳤다.** 자세한 내용은 `TOOLING.md` 의
+"도구 사본만은 낡을 수 있다" 절에 있다. 요약하면, 회사 PC 의 `drivelog.sh` 가
+`order.txt` 를 모르던 판이어서 route `00000007`(40개 파일)을 올리면서 원장을
+갱신하지 않았다. 그대로 두면 `prune` 이 가장 최신 주행을 먼저 지웠을 것이다.
+`init-order --yes` 로 히스토리에서 복원했고(19개 route, 기존 18개는 그대로),
+재발을 막으려고 도구 버전 비교 경고와 `sync` 서브커맨드를 넣었다.
 
 ## 환경 (확인된 사실)
 
