@@ -3,8 +3,10 @@
 #
 # 설계 목표: 업로드 PC(집/회사)가 바뀌어도 로컬 동기화가 0 에 수렴할 것.
 #   - 로컬에 리포지토리 사본을 남기지 않는다 (작업용 클론은 매번 만들고 지운다).
-#   - 기존 데이터(수 GB)의 blob 은 절대 내려받지 않는다 (--filter=blob:limit=64k).
-#     64KB 미만의 작은 파일(README, 삭제 이력)만 함께 받는다.
+#   - 기존 데이터(수 GB)의 blob 은 절대 내려받지 않는다 (--filter=blob:limit=2m).
+#     2MB 미만의 작은 파일(README, 삭제 이력, 순서 원장)만 함께 받는다.
+#     (rlog.zst 는 개당 약 11MB 라 섞여 들어오지 않는다. 64KB 였을 때는
+#      pruned.txt 가 커지면 읽지 못해 정리한 로그를 다시 올리는 문제가 있었다.)
 #   - 워킹트리를 만들지 않는다 (--no-checkout + git plumbing 으로 커밋 생성).
 #   - "무엇이 이미 올라갔는가" 의 상태는 원격 트리 목록이 유일한 진실이다.
 #     로컬 상태 파일이 없으므로 PC 간 상태 불일치가 원리적으로 발생하지 않는다.
@@ -18,6 +20,7 @@
 #   ./drivelog.sh put <파일>...                   # 임의 파일을 브랜치 루트에 올린다
 #   ./drivelog.sh prune  [--keep N] [--yes]       # 오래된 route 를 브랜치에서 덜어낸다
 #   ./drivelog.sh init-order [--dry-run] [--yes]  # 업로드 순서 원장을 히스토리에서 복원(1회)
+#   ./drivelog.sh shrink --keep-gb N [--yes]      # 최근 N GB 만 남기고 히스토리 재작성(용량 회수)
 
 set -euo pipefail
 
@@ -65,7 +68,7 @@ human() {
 }
 
 # ---------- 인자 파싱 ----------
-show_usage() { sed -n '12,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+show_usage() { sed -n '14,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 case "${1:-}" in
   -h|--help|help) show_usage ;;
 esac
@@ -76,6 +79,8 @@ DRY_RUN=0
 FROM_DIR=""
 ROUTE_FILTER=""
 KEEP_ROUTES=5
+KEEP_GB=""
+AVG_MB=11      # rlog.zst 한 개의 평균 크기 (wk2 실측 약 11.1MB). shrink 의 용량 추정용.
 PRUNE_YES=0
 PUT_PATHS=()
 
@@ -89,6 +94,8 @@ while [ $# -gt 0 ]; do
     --from-dir) FROM_DIR="$2"; shift 2 ;;
     --route)    ROUTE_FILTER="$2"; shift 2 ;;
     --keep)     KEEP_ROUTES="$2"; shift 2 ;;
+    --keep-gb)  KEEP_GB="$2"; shift 2 ;;
+    --avg-mb)   AVG_MB="$2"; shift 2 ;;
     --yes)      PRUNE_YES=1; shift ;;
     --dry-run)  DRY_RUN=1; shift ;;
     -h|--help)  show_usage ;;
@@ -171,7 +178,7 @@ auth_hint() {
 make_work_repo() {
   WORK="$(mktemp -d 2>/dev/null || mktemp -d -t drivelog)"
   git clone --quiet \
-    --filter=blob:limit=64k --no-checkout --depth 1 \
+    --filter=blob:limit=2m --no-checkout --depth 1 \
     --single-branch --branch "$BRANCH" \
     "$REMOTE_URL" "$WORK/repo" \
     || auth_hint
@@ -181,7 +188,7 @@ make_work_repo() {
 
 # 원격 tip 을 다시 읽어온다 (다른 PC 가 그 사이 push 했을 수 있다).
 refresh_tip() {
-  "${G[@]}" fetch --quiet --depth 1 --filter=blob:limit=64k origin "$BRANCH"
+  "${G[@]}" fetch --quiet --depth 1 --filter=blob:limit=2m origin "$BRANCH"
   BASE="$("${G[@]}" rev-parse FETCH_HEAD)"
 }
 
@@ -432,12 +439,29 @@ build_and_push() {
       return 0
     fi
 
+    # (1) 다른 PC 가 먼저 올려서 거부된 경우 — tip 을 다시 읽고 그 위에 다시 쌓는다.
     if grep -qiE 'non-fast-forward|fetch first|stale info|cannot lock ref|failed to lock' "$WORK/push.err"; then
       local wait_s=$(( (RANDOM % 3) + attempt ))
       [ "$wait_s" -gt 10 ] && wait_s=10
       log "  push 거부됨 (다른 PC 가 먼저 올린 듯). ${wait_s}초 후 tip 갱신 재시도 ${attempt}/${PUSH_RETRIES}"
       sleep "$wait_s"
       refresh_tip
+      continue
+    fi
+
+    # (2) 전송 중 연결이 끊긴 경우 — 이쪽이 실제로 훨씬 자주 발생한다.
+    # 예전에는 이 경우를 재시도 대상에서 빼놓아 배치 하나가 끊기면 즉시 포기했다.
+    # 커밋은 이미 만들어져 있고 원격 상태도 바뀌지 않았으므로 그대로 다시 보내면 된다.
+    # 대기를 점점 늘린다 (10, 20, 40, 60, 90, 120, 이후 120초 고정).
+    if grep -qiE 'connection reset|broken pipe|hung up unexpectedly|connection closed|timed out|timeout|early eof|rpc failed|index-pack failed|unexpected disconnect|could not read from remote' "$WORK/push.err"; then
+      local waits=(10 20 40 60 90 120) wait_s=120
+      [ "$attempt" -le "${#waits[@]}" ] && wait_s="${waits[$((attempt - 1))]}"
+      log "  push 중 연결 끊김. ${wait_s}초 후 재시도 ${attempt}/${PUSH_RETRIES}"
+      sed 's/^/    /' "$WORK/push.err" | head -2 >&2
+      sleep "$wait_s"
+      # 그 사이 다른 PC 가 올렸을 수도 있으니 tip 을 다시 읽는다.
+      # 실패해도(네트워크가 아직 안 돌아왔을 수 있다) 다음 시도에서 다시 본다.
+      refresh_tip || true
       continue
     fi
 
@@ -630,8 +654,15 @@ cmd_pick() {
   local routes; routes="$(cut -f1 "$WORK/all.segs" | sort -ru)"
 
   log ""
-  printf '  %-3s %-26s %8s %10s  %s\n' "#" "route" "미업로드" "받을크기" "상태" >&2
-  printf '  %-3s %-26s %8s %10s  %s\n' "---" "--------------------------" "--------" "----------" "--------------------" >&2
+  # 열 의미를 한눈에 구분되게 둔다.
+  #   올라감 : 브랜치에 이미 있는 세그먼트 / 기기의 전체 세그먼트
+  #   남음   : 이번에 올릴 개수
+  # 한글은 표시 폭이 2 칸이라 %9s 같은 자리수 지정이 데이터와 어긋난다.
+  # 머리말은 공백을 직접 넣어 아래 데이터 열과 맞춘다.
+  printf '  %-3s %-26s %s %s %s  %s\n' \
+    "#" "route" "   올라감" "  남음" "  받을크기" "상태" >&2
+  printf '  %-3s %-26s %9s %6s %10s  %s\n' \
+    "---" "--------------------------" "---------" "------" "----------" "----------" >&2
 
   local -a R_NAME=() R_MISS=()
   local idx=0 r tot n_all n_miss b_miss status
@@ -645,14 +676,15 @@ cmd_pick() {
     R_NAME[$idx]="$r"
     R_MISS[$idx]="$n_miss"
     if [ "$n_miss" -eq 0 ]; then
-      status="업로드 완료"
-      printf '  %-3s %-26s %8s %10s  %s\n' "$idx" "$r" "-" "-" "$status" >&2
+      status="완료"
+      printf '  %-3s %-26s %9s %6s %10s  %s\n' \
+        "$idx" "$r" "$n_all/$n_all" "-" "-" "$status" >&2
     else
-      if [ "$n_miss" -eq "$n_all" ]; then status="전체 미업로드"
-      else status="일부 업로드 ($((n_all - n_miss))/$n_all)"; fi
+      if [ "$n_miss" -eq "$n_all" ]; then status="미업로드"
+      else status="일부"; fi
       sum_miss=$((sum_miss + n_miss)); sum_bytes=$((sum_bytes + b_miss))
-      printf '  %-3s %-26s %8s %10s  %s\n' \
-        "$idx" "$r" "$n_miss/$n_all" "$(human "$b_miss")" "$status" >&2
+      printf '  %-3s %-26s %9s %6s %10s  %s\n' \
+        "$idx" "$r" "$((n_all - n_miss))/$n_all" "$n_miss" "$(human "$b_miss")" "$status" >&2
     fi
   done <<< "$routes"
 
@@ -1048,7 +1080,207 @@ cmd_init_order() {
   step "완료. 이제 prune 이 업로드 순서로 판단한다."
 }
 
+# ---------- 명령: shrink (저장 용량 실제 회수, 히스토리 재작성) ----------
+# prune 은 브랜치 tip 에서 파일을 덜어낼 뿐 히스토리에 blob 이 남아 GitHub 이
+# 실제로 쓰는 용량은 그대로다. shrink 는 브랜치를 "최근에 올린 N GB 만 담은
+# 단일 커밋" 으로 교체하고 force push 한다. 이전 커밋들이 어디서도 참조되지
+# 않게 되므로 GitHub 의 GC 가 그 blob 들을 회수한다.
+#
+# 핵심: 남길 파일은 내려받지도 다시 올리지도 않는다.
+#   남길 파일의 blob 은 이미 원격에 있다. 새 트리가 그 blob 을 SHA 로 참조만 하면
+#   (mktree --missing), push 할 때 git 은 원격의 기존 tip 에서 도달 가능한 객체를
+#   제외하므로 실제로 전송되는 것은 새 커밋·트리와 작은 원장 파일뿐이다.
+#   10 GB 를 남겨도 전송량은 수십 KB 다.
+#
+# "최근" 의 기준은 업로드 순서다 (route 이름도 기기 시각도 믿을 수 없다).
+# 각 파일이 히스토리상 어느 커밋에서 추가됐는지가 곧 업로드 시점이다.
+# route 단위로 자른다. route 의 최근성은 그 route 의 파일이 마지막으로 올라간 시점.
+#
+# 크기는 추정이다. 부분 클론에는 blob 이 없어 실제 크기를 알 수 없다
+# (알려고 하면 수 GB 를 받게 된다). 파일 수 × AVG_MB 로 계산한다.
+#
+# 되돌릴 수 없다. 삭제된 로그는 GitHub GC 이후 영구히 사라진다.
+# 기본은 계획만 출력하고, 실제 실행에는 --yes 가 필요하다.
+cmd_shrink() {
+  [ -n "$KEEP_GB" ] || die "남길 용량을 지정할 것: --keep-gb 10"
+  case "$KEEP_GB$AVG_MB" in *[!0-9.]*) die "--keep-gb / --avg-mb 는 숫자여야 한다" ;; esac
+
+  step "프로필 $PROFILE  ->  브랜치 $BRANCH  (최근 업로드 ${KEEP_GB} GB 만 남기고 히스토리 재작성)"
+
+  WORK="$(mktemp -d 2>/dev/null || mktemp -d -t drivelog)"
+  mkdir -p "$WORK/stage"
+  log "히스토리를 받는다 (blob 제외, 커밋·트리만) …"
+  git clone --quiet --filter=blob:none --no-checkout \
+    --single-branch --branch "$BRANCH" "$REMOTE_URL" "$WORK/repo" || auth_hint
+  G=(git -C "$WORK/repo")
+  local OLD; OLD="$("${G[@]}" rev-parse HEAD)"
+  BASE="$OLD"
+
+  # 1) route 별 "마지막으로 올라간 시점" (히스토리 순번)
+  "${G[@]}" log --reverse --no-renames --diff-filter=A --name-only \
+      --format='tformat:@@' -- "$REPO_SUBDIR" \
+    | awk -v sub_="$REPO_SUBDIR/" '
+        /^@@$/ { c++; next }
+        index($0, sub_) == 1 {
+          r = substr($0, length(sub_) + 1)
+          sub(/--[0-9]+--rlog\.zst$/, "", r)
+          last[r] = c
+        }
+        END { for (r in last) print last[r] "\t" r }' \
+    | sort -rn > "$WORK/routes.recent"
+
+  # 2) 현재 tip 에 실제로 있는 파일 (route 별 개수)
+  "${G[@]}" ls-tree "$OLD:$REPO_SUBDIR" > "$WORK/tip.entries"
+  local n_tip; n_tip="$(count_lines < "$WORK/tip.entries")"
+  [ "$n_tip" -gt 0 ] || { log "브랜치에 로그가 없다."; return 0; }
+  cut -f2 "$WORK/tip.entries" | sed 's/--[0-9]*--rlog\.zst$//' | sort | uniq -c \
+    | awk '{print $2 "\t" $1}' > "$WORK/tip.count"
+
+  # 히스토리에 없는 route(이론상 없어야 함)는 가장 오래된 것으로 뒤에 붙인다.
+  awk -F'\t' 'NR==FNR{seen[$2]=1; next} !($1 in seen){print "0\t" $1}' \
+    "$WORK/routes.recent" "$WORK/tip.count" >> "$WORK/routes.recent"
+
+  # 3) 최근 route 부터 목표 용량에 닿을 때까지 남긴다 (route 를 쪼개지 않는다).
+  local target_mb
+  target_mb="$(awk -v g="$KEEP_GB" 'BEGIN{printf "%d", g*1024}')"
+  awk -F'\t' -v tgt="$target_mb" -v avg="$AVG_MB" '
+      NR == FNR { cnt[$1] = $2; next }
+      ($2 in cnt) {
+        n = cnt[$2]
+        if (acc < tgt) { print "K\t" $2 "\t" n; acc += n * avg }
+        else           { print "D\t" $2 "\t" n }
+      }' "$WORK/tip.count" "$WORK/routes.recent" > "$WORK/plan"
+
+  local k_routes k_files d_routes d_files
+  k_routes="$(grep -c '^K' "$WORK/plan" || true)"
+  d_routes="$(grep -c '^D' "$WORK/plan" || true)"
+  k_files="$(awk -F'\t' '$1=="K"{s+=$3} END{print s+0}' "$WORK/plan")"
+  d_files="$(awk -F'\t' '$1=="D"{s+=$3} END{print s+0}' "$WORK/plan")"
+
+  est() { awk -v n="$1" -v a="$AVG_MB" 'BEGIN{m=n*a; if (m>=1024) printf "%.1f GB", m/1024; else printf "%.1f MB", m}'; }
+  log ""
+  log "현재 브랜치 : 파일 $n_tip 개, 약 $(est "$n_tip")  (커밋 $("${G[@]}" rev-list --count HEAD) 개)"
+  log "남길 것     : route $k_routes 개, 파일 $k_files 개, 약 $(est "$k_files")"
+  log "지울 것     : route $d_routes 개, 파일 $d_files 개, 약 $(est "$d_files")"
+  log "  (크기는 파일 수 × ${AVG_MB} MB 추정치)"
+
+  if [ "$d_files" -eq 0 ]; then log ""; log "지울 것이 없다."; return 0; fi
+
+  # 길면 앞뒤만, 짧으면 전부 보여준다.
+  show_part() {   # $1=K|D  $2=앞 개수  $3=뒤 개수
+    awk -F'\t' -v t="$1" '$1==t{print "  " $2 "  (" $3 "개)"}' "$WORK/plan" > "$WORK/show.tmp"
+    local n; n="$(count_lines < "$WORK/show.tmp")"
+    if [ "$n" -le $(( $2 + $3 )) ]; then cat "$WORK/show.tmp" >&2
+    else head -n "$2" "$WORK/show.tmp" >&2; log "  … ($((n - $2 - $3)) 개 생략)"; tail -n "$3" "$WORK/show.tmp" >&2; fi
+  }
+  log ""
+  log "남길 route — 최근 업로드 순:"
+  show_part K 5 3
+  log ""
+  log "지울 route — 최근 업로드 순 (아래로 갈수록 오래됨):"
+  show_part D 3 3
+
+  if [ "$PRUNE_YES" -ne 1 ]; then
+    log ""
+    log "계획만 출력했다. 실제로 하려면 --yes 를 붙일 것."
+    log "주의: 되돌릴 수 없다. 지운 로그는 GitHub GC 이후 영구히 사라진다."
+    log "      기기에 원본이 남아 있는 route 만 다시 올릴 수 있다."
+    return 0
+  fi
+
+  # 4) push 는 별도의 "얕은(depth 1)" 클론에서 한다. 이것이 핵심이다.
+  #
+  # git push 는 원격이 이미 가진 객체를 "새 커밋의 부모" 를 경계로 판단한다.
+  # 그런데 shrink 커밋은 히스토리를 끊으려고 부모가 없다. 경계가 없으므로
+  # 일반 클론에서 push 하면 남길 blob 을 전부(=수 GB) 다시 보낸다. 실제 테스트에서
+  # 그렇게 됐다. 얕은 클론에서는 git 이 원격 tip 의 트리 전체를 "이미 있음" 으로
+  # 처리하므로(edge-aggressive) 새 커밋·트리와 작은 원장 파일만 전송된다.
+  # 평소 upload 가 쓰는 make_work_repo 도 같은 이유로 얕은 클론이다.
+  log ""
+  log "push 용 얕은 클론을 만든다 …"
+  git clone --quiet --filter=blob:limit=2m --no-checkout --depth 1 \
+    --single-branch --branch "$BRANCH" "$REMOTE_URL" "$WORK/push" || auth_hint
+  G=(git -C "$WORK/push")
+  local now; now="$("${G[@]}" rev-parse HEAD)"
+  [ "$now" = "$OLD" ] || die "그 사이 원격이 바뀌었다 ($OLD → $now). 다시 실행할 것."
+
+  # 5) 새 트리 구성 — 기존 blob 을 SHA 로 참조만 한다 (내려받지 않는다).
+  awk -F'\t' '$1=="K"{print $2}' "$WORK/plan" | sort > "$WORK/keep.routes"
+  awk -F'\t' 'NR==FNR{k[$1]=1; next}
+      { n=$2; sub(/--[0-9]+--rlog\.zst$/, "", n); if (n in k) print }' \
+      "$WORK/keep.routes" "$WORK/tip.entries" > "$WORK/keep.entries"
+  awk -F'\t' 'NR==FNR{k[$1]=1; next}
+      { n=$2; r=n; sub(/--[0-9]+--rlog\.zst$/, "", r); if (!(r in k)) print n }' \
+      "$WORK/keep.routes" "$WORK/tip.entries" > "$WORK/drop.names"
+
+  local subtree root commit
+  subtree="$("${G[@]}" mktree --missing < "$WORK/keep.entries")"
+  [ -n "$subtree" ] || die "서브트리 생성 실패"
+
+  # 순서 원장: 남긴 route 를 업로드 순(오래된 → 최근)으로 다시 쓴다.
+  awk -F'\t' '$1=="K"{print $2}' "$WORK/plan" | tac > "$WORK/stage/$ORDER_FILE"
+  # 삭제 이력: 기존 + 이번에 지운 것. 기기에 남은 원본을 다시 올리지 않기 위함.
+  { "${G[@]}" cat-file -p "$OLD:$PRUNED_FILE" 2>/dev/null || true
+    cat "$WORK/drop.names"; } | { grep . || true; } | sort -u > "$WORK/stage/$PRUNED_FILE"
+
+  local oblob pblob
+  oblob="$("${G[@]}" hash-object -w --no-filters -- "$WORK/stage/$ORDER_FILE")"
+  pblob="$("${G[@]}" hash-object -w --no-filters -- "$WORK/stage/$PRUNED_FILE")"
+  [ -n "$oblob" ] && [ -n "$pblob" ] || die "원장 파일 생성 실패"
+  {
+    printf '040000 tree %s\t%s\n' "$subtree" "$REPO_SUBDIR"
+    printf '100644 blob %s\t%s\n' "$oblob" "$ORDER_FILE"
+    printf '100644 blob %s\t%s\n' "$pblob" "$PRUNED_FILE"
+  } > "$WORK/add.root"
+  "${G[@]}" ls-tree "$OLD" > "$WORK/old.root"
+  root="$(merge_tree "$WORK/old.root" "$WORK/add.root")"
+  [ -n "$root" ] || die "루트 트리 생성 실패"
+
+  # 부모 없는 커밋 = 히스토리 단절. 이전 커밋 전체가 참조를 잃는다.
+  commit="$("${G[@]}" commit-tree "$root" \
+    -m "drivelog: shrink to latest ~${KEEP_GB}GB ($k_routes routes / $k_files files); history reset")"
+  [ -n "$commit" ] || die "커밋 생성 실패 (빈 SHA)"
+
+  log ""
+  log "이전 tip: $OLD"
+  log "새 tip  : $commit (부모 없음)"
+  log "force push … (전송량은 커밋·트리뿐이라 작다)"
+
+  # --force-with-lease: 그 사이 다른 PC 가 올렸으면 덮어쓰지 않고 실패한다.
+  #
+  # 여기서는 다른 명령과 달리 --no-thin 을 쓰지 않는다 (실측으로 확인).
+  #   얕은 클론 + --no-thin : 부모 없는 커밋이라 남길 blob 을 다시 보내려다
+  #                          로컬에 없어서 push 실패.
+  #   얕은 클론 + thin      : 커밋 1 + 트리 몇 개만 전송 (수백 바이트). blob 0 개.
+  # thin 이 걱정되는 이유는 기존 blob 을 델타 기준으로 쓰려다 다운로드를 유발하는
+  # 것인데, 여기서 새로 생기는 blob 은 작은 원장 파일 두 개뿐이고 그 기준이 될
+  # 이전 원장 파일은 2MB 미만이라 이미 로컬에 있다. GIT_NO_LAZY_FETCH=1 이라
+  # 혹시 받으려 해도 조용히 받지 않고 실패한다.
+  local attempt
+  for ((attempt = 1; attempt <= 5; attempt++)); do
+    if "${G[@]}" push \
+         --force-with-lease="refs/heads/$BRANCH:$OLD" \
+         origin "$commit:refs/heads/$BRANCH" 2>"$WORK/push.err"; then
+      step "완료. $BRANCH 를 route $k_routes 개(약 $(est "$k_files"))로 교체했다."
+      log ""
+      log "GitHub 이 실제 용량을 줄이는 것은 서버 GC 이후다 (즉시 아님)."
+      log "며칠 지나도 저장소 크기(Settings → General 하단)가 그대로면"
+      log "GitHub Support 에 '브랜치 히스토리를 재작성했으니 GC 를 요청한다' 고 문의할 것."
+      return 0
+    fi
+    if grep -qiE 'stale info|rejected' "$WORK/push.err"; then
+      cat "$WORK/push.err" >&2
+      die "그 사이 다른 PC 가 올린 것 같다. 아무것도 바뀌지 않았다. 다시 실행할 것."
+    fi
+    log "  push 실패, $((attempt * 15))초 후 재시도 $attempt/5"
+    sed 's/^/    /' "$WORK/push.err" | head -2 >&2
+    sleep $((attempt * 15))
+  done
+  die "force push 실패. 원격은 바뀌지 않았다 (이전 tip $OLD 그대로)."
+}
+
 case "$CMD" in
+  shrink)     cmd_shrink ;;
   status)     cmd_status ;;
   list)       cmd_list ;;
   pick|i)     cmd_pick ;;
